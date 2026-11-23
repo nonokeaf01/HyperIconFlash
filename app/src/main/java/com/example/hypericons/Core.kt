@@ -1,9 +1,13 @@
 package com.example.hypericons
 
+import android.content.ContentValues
 import android.content.Context
 import android.content.res.Resources
 import android.graphics.*
 import android.graphics.drawable.Drawable
+import android.os.Build
+import android.os.Environment
+import android.provider.MediaStore
 import org.xmlpull.v1.XmlPullParser
 import org.xmlpull.v1.XmlPullParserFactory
 import rikka.shizuku.Shizuku
@@ -100,7 +104,7 @@ object PngUtil {
         return b
     }
 
-    /** Crop transparent padding, then fit the artwork into a size x size canvas (like the guide's resize script). */
+    /** Crop transparent padding, then fit the artwork into a size x size canvas. */
     fun trimAndFit(src: Bitmap, size: Int): Bitmap {
         val w = src.width
         val h = src.height
@@ -141,7 +145,27 @@ object PngUtil {
         return addColorChunks(o.toByteArray())
     }
 
-    /** The guide's script adds sRGB + sBIT chunks right after IHDR. */
+    fun buildPreviewJpg(samples: List<Bitmap>): ByteArray {
+        val out = Bitmap.createBitmap(1080, 1080, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(out)
+        canvas.drawColor(Color.rgb(20, 22, 26))
+        val paint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
+        val cols = 4
+        val cell = 1080f / cols
+        val pad = 42f
+        for ((i, bmp) in samples.take(16).withIndex()) {
+            val r = i / cols
+            val c = i % cols
+            val dst = RectF(c * cell + pad, r * cell + pad, (c + 1) * cell - pad, (r + 1) * cell - pad)
+            canvas.drawBitmap(bmp, null, dst, paint)
+        }
+        val o = ByteArrayOutputStream()
+        out.compress(Bitmap.CompressFormat.JPEG, 90, o)
+        out.recycle()
+        return o.toByteArray()
+    }
+
+    /** Adds sRGB + sBIT chunks right after IHDR. */
     private fun addColorChunks(png: ByteArray): ByteArray {
         var pos = 8
         var hasSrgb = false; var hasSbit = false; var hasIccp = false
@@ -173,6 +197,143 @@ object PngUtil {
 object Pipeline {
     private const val THEME_MGR = "com.android.thememanager"
     private val pkgPng = Regex("^res/[^/]+/([A-Za-z0-9_]+(\\.[A-Za-z0-9_]+)+)\\.png\$")
+
+    fun exportMtz(
+        ctx: Context, pack: String, trim: Boolean, manualSize: Int?, log: (String) -> Unit
+    ) {
+        if (pack.isEmpty()) error("Pick an icon pack first")
+        val work = File(ctx.cacheDir, "mtz_work")
+        work.deleteRecursively(); work.mkdirs()
+
+        val pm = ctx.packageManager
+        val appLabel = try {
+            pm.getApplicationLabel(pm.getApplicationInfo(pack, 0)).toString().trim()
+        } catch (_: Exception) {
+            pack.substringAfterLast('.')
+        }.ifEmpty { "CustomIcons" }
+        val safeName = appLabel.replace(Regex("[^A-Za-z0-9._-]+"), "_")
+
+        val res = pm.getResourcesForApplication(pack)
+        val map = IconPack.readAppFilter(res, pack)
+        log("Icon pack \"$appLabel\" maps ${map.size} apps")
+
+        val size = if (manualSize != null && manualSize > 0) manualSize else 266
+        if (trim) log("Resizing icons to ${size}px")
+
+        val iconsZip = File(work, "icons")
+        val previewSamples = ArrayList<Bitmap>(16)
+        var ok = 0
+        var miss = 0
+
+        try {
+            ZipOutputStream(BufferedOutputStream(FileOutputStream(iconsZip))).use { zos ->
+                for ((pkg, dn) in map) {
+                    try {
+                        val id = res.getIdentifier(dn, "drawable", pack)
+                        if (id == 0) { miss++; continue }
+                        var bmp = PngUtil.render(res.getDrawable(id, null))
+                        if (trim) {
+                            val t = PngUtil.trimAndFit(bmp, size)
+                            if (t !== bmp) bmp.recycle()
+                            bmp = t
+                        }
+                        if (previewSamples.size < 16) {
+                            previewSamples.add(Bitmap.createScaledBitmap(bmp, 180, 180, true))
+                        }
+                        val bytes = PngUtil.encode(bmp)
+                        bmp.recycle()
+                        zos.putNextEntry(ZipEntry("res/drawable-xxhdpi/$pkg.png"))
+                        zos.write(bytes)
+                        zos.closeEntry()
+                        ok++
+                    } catch (_: Throwable) {
+                        miss++
+                    }
+                    if ((ok + miss) % 500 == 0) log("…${ok + miss}/${map.size}")
+                }
+            }
+            log("Packed $ok icons (skipped $miss)")
+
+            val previewBytes = PngUtil.buildPreviewJpg(previewSamples)
+            val escapedTitle = appLabel
+                .replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+            val descXml = """<?xml version="1.0" encoding="utf-8"?>
+<MIUI-Theme>
+    <title>$escapedTitle</title>
+    <designer>HyperIconFlash</designer>
+    <author>HyperIconFlash</author>
+    <version>1.0</version>
+    <uiVersion>15</uiVersion>
+</MIUI-Theme>
+""".toByteArray(Charsets.UTF_8)
+
+            val mtzFile = File(work, "$safeName.mtz")
+            ZipOutputStream(BufferedOutputStream(FileOutputStream(mtzFile))).use { zos ->
+                zos.putNextEntry(ZipEntry("description.xml"))
+                zos.write(descXml)
+                zos.closeEntry()
+
+                zos.putNextEntry(ZipEntry("preview/preview_icons_0.jpg"))
+                zos.write(previewBytes)
+                zos.closeEntry()
+
+                writeStoredFile(zos, "icons", iconsZip)
+            }
+
+            val savedAt = saveToDownloads(ctx, mtzFile, "$safeName.mtz")
+            log("Saved ${mtzFile.length() / 1024} KB → $savedAt")
+            log("Done ✓  Import $safeName.mtz using Themes, MTZ Tester, or Xiaomi Backup restore.")
+        } finally {
+            previewSamples.forEach { it.recycle() }
+        }
+    }
+
+    private fun writeStoredFile(zos: ZipOutputStream, entryName: String, file: File) {
+        val crc = CRC32()
+        val buf = ByteArray(65536)
+        FileInputStream(file).use { fis ->
+            while (true) {
+                val n = fis.read(buf)
+                if (n < 0) break
+                crc.update(buf, 0, n)
+            }
+        }
+        val entry = ZipEntry(entryName).apply {
+            method = ZipEntry.STORED
+            size = file.length()
+            compressedSize = file.length()
+            this.crc = crc.value
+        }
+        zos.putNextEntry(entry)
+        FileInputStream(file).use { it.copyTo(zos) }
+        zos.closeEntry()
+    }
+
+    private fun saveToDownloads(ctx: Context, file: File, displayName: String): String {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val values = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
+                put(MediaStore.MediaColumns.MIME_TYPE, "application/octet-stream")
+                put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+            }
+            val resolver = ctx.contentResolver
+            val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                ?: error("Couldn't create file in Downloads")
+            resolver.openOutputStream(uri)?.use { out ->
+                FileInputStream(file).use { it.copyTo(out) }
+            } ?: error("Couldn't open Downloads output stream")
+            return "Downloads/$displayName"
+        } else {
+            @Suppress("DEPRECATION")
+            val dl = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            dl.mkdirs()
+            val dest = File(dl, displayName)
+            file.copyTo(dest, overwrite = true)
+            return dest.absolutePath
+        }
+    }
 
     fun run(
         ctx: Context, pack: String, iconsDir: String, trim: Boolean, keepExtras: Boolean,
