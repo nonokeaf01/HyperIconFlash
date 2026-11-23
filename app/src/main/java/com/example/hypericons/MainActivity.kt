@@ -17,6 +17,7 @@ class MainActivity : Activity() {
     private lateinit var trimBox: CheckBox
     private lateinit var keepBox: CheckBox
     private lateinit var logView: TextView
+    private lateinit var mtzBtn: Button
     private lateinit var runBtn: Button
     private lateinit var restoreBtn: Button
     private var packs: List<Pair<String, String>> = emptyList()
@@ -37,7 +38,7 @@ class MainActivity : Activity() {
 
         status = TextView(this)
         val grant = Button(this).apply {
-            text = "Grant Shizuku permission"
+            text = "Grant Shizuku permission (only for direct flash)"
             setOnClickListener {
                 if (!Shizuku.pingBinder()) toast("Start Shizuku first (Shizuku app → Start via wireless debugging)")
                 else if (Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) refreshStatus()
@@ -46,24 +47,28 @@ class MainActivity : Activity() {
         }
         spinner = Spinner(this)
         pkgOverride = EditText(this).apply { hint = "…or type icon pack package name" }
+        sizeEdit = EditText(this).apply {
+            hint = "auto (266px for .mtz / theme size for flash)"
+            inputType = InputType.TYPE_CLASS_NUMBER
+        }
+        trimBox = CheckBox(this).apply { text = "Trim padding + resize icons"; isChecked = true }
+        mtzBtn = Button(this).apply { text = "Export .mtz to Downloads (no Shizuku)"; setOnClickListener { start(Mode.MTZ) } }
+
         dirEdit = EditText(this).apply {
             setText("/sdcard/Android/data/com.android.thememanager/files/MIUI/theme/.data/content/icons")
         }
-        sizeEdit = EditText(this).apply {
-            hint = "auto"
-            inputType = InputType.TYPE_CLASS_NUMBER
-        }
-        trimBox = CheckBox(this).apply { text = "Trim padding + resize to the theme's icon size"; isChecked = true }
-        keepBox = CheckBox(this).apply { text = "Keep the theme's masks/borders (res/ extras)" }
-        runBtn = Button(this).apply { text = "Build & flash into dummy theme"; setOnClickListener { start(false) } }
-        restoreBtn = Button(this).apply { text = "Restore backup"; setOnClickListener { start(true) } }
+        keepBox = CheckBox(this).apply { text = "Keep the theme's masks/borders (direct flash only)" }
+        runBtn = Button(this).apply { text = "Build & flash into dummy theme (Shizuku)"; setOnClickListener { start(Mode.FLASH) } }
+        restoreBtn = Button(this).apply { text = "Restore backup (Shizuku)"; setOnClickListener { start(Mode.RESTORE) } }
         logView = TextView(this).apply { setTextIsSelectable(true); setPadding(0, dp(12), 0, 0) }
 
-        root.addView(status); root.addView(grant)
         root.addView(label("Icon pack")); root.addView(spinner); root.addView(pkgOverride)
+        root.addView(label("Icon size px (blank = 266px for .mtz, or auto from theme)")); root.addView(sizeEdit)
+        root.addView(trimBox)
+        root.addView(mtzBtn)
+        root.addView(label("Optional: Direct Shizuku flash")); root.addView(status); root.addView(grant)
         root.addView(label("Theme icons folder")); root.addView(dirEdit)
-        root.addView(label("Icon size px (blank = detect from theme)")); root.addView(sizeEdit)
-        root.addView(trimBox); root.addView(keepBox)
+        root.addView(keepBox)
         root.addView(runBtn); root.addView(restoreBtn); root.addView(logView)
         setContentView(ScrollView(this).apply { addView(root); fitsSystemWindows = true })
 
@@ -86,7 +91,7 @@ class MainActivity : Activity() {
 
     private fun refreshStatus() {
         status.text = when {
-            !Shizuku.pingBinder() -> "Shizuku: not running (open Shizuku app → Start via wireless debugging)"
+            !Shizuku.pingBinder() -> "Shizuku: not running (not needed for .mtz export)"
             Shizuku.isPreV11() -> "Shizuku: unsupported version (update Shizuku)"
             Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED -> "Shizuku: ready ✓"
             else -> "Shizuku: running — tap Grant Shizuku permission"
@@ -120,14 +125,18 @@ class MainActivity : Activity() {
         return seen.entries.sortedBy { it.value.lowercase() }.map { it.key to it.value }
     }
 
-    private fun start(isRestore: Boolean) {
-        if (!Shizuku.pingBinder()) {
-            toast("Start Shizuku first")
-            return
-        }
-        if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
-            Shizuku.requestPermission(100)
-            return
+    private enum class Mode { MTZ, FLASH, RESTORE }
+
+    private fun start(mode: Mode) {
+        if (mode != Mode.MTZ) {
+            if (!Shizuku.pingBinder()) {
+                toast("Start Shizuku first")
+                return
+            }
+            if (Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED) {
+                Shizuku.requestPermission(100)
+                return
+            }
         }
         val selectedPkg = pkgOverride.text.toString().trim().ifEmpty {
             packs.getOrNull(spinner.selectedItemPosition)?.first.orEmpty()
@@ -147,10 +156,10 @@ class MainActivity : Activity() {
 
         Thread {
             try {
-                if (isRestore) {
-                    Pipeline.restore(this, iconsDir, appendLog)
-                } else {
-                    Pipeline.run(this, selectedPkg, iconsDir, trim, keepExtras, manualSize, appendLog)
+                when (mode) {
+                    Mode.MTZ -> Pipeline.exportMtz(this, selectedPkg, trim, manualSize, appendLog)
+                    Mode.FLASH -> Pipeline.run(this, selectedPkg, iconsDir, trim, keepExtras, manualSize, appendLog)
+                    Mode.RESTORE -> Pipeline.restore(this, iconsDir, appendLog)
                 }
             } catch (t: Throwable) {
                 appendLog("ERROR: ${t.message ?: t.javaClass.simpleName}")
@@ -161,6 +170,7 @@ class MainActivity : Activity() {
     }
 
     private fun setBusy(busy: Boolean) {
+        mtzBtn.isEnabled = !busy
         runBtn.isEnabled = !busy
         restoreBtn.isEnabled = !busy
     }
